@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 import uuid
@@ -19,7 +18,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from m365_auth import (
     CHAT_SCOPE,
@@ -27,6 +26,7 @@ from m365_auth import (
     DEFAULT_ENV,
     DEFAULT_HAR,
     DEFAULT_TOKEN_REFRESH_SKEW_SECONDS,
+    ChatResult,
     OAUTH_REFRESH_ENTRY,
     ensure_chat_token,
     extract_chat_template,
@@ -106,6 +106,7 @@ class Gateway:
         self.entries = read_har(args.har)
         self.websocket_entry = self.entries[args.websocket_entry]
         self.chat_template = extract_chat_template(get_raw_entry(args.har, args.websocket_entry))
+        self.default_conversation_id = str(uuid.uuid4())
         self.proxy_api_key = load_env(args.env).get("M365_PROXY_API_KEY", "")
 
     def env(self) -> dict[str, str]:
@@ -125,10 +126,22 @@ class Gateway:
         )
         ensure_chat_token(token_args, self.entries, env)
 
-    def complete(self, prompt: str, conversation_id: str | None = None) -> tuple[str, str]:
+    def resolve_conversation_id(self, conversation_id: str | None = None) -> str:
+        if conversation_id:
+            return conversation_id
+        if self.args.new_conversation_per_request:
+            return str(uuid.uuid4())
+        return self.default_conversation_id
+
+    def complete(
+        self,
+        prompt: str,
+        conversation_id: str | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> ChatResult:
         env = self.env()
         self.ensure_token(env)
-        resolved_conversation_id = conversation_id or str(uuid.uuid4())
+        resolved_conversation_id = self.resolve_conversation_id(conversation_id)
         result = send_chat_prompt(
             har_path=self.args.har,
             websocket_entry=self.args.websocket_entry,
@@ -140,8 +153,20 @@ class Gateway:
             raw_websocket=False,
             entry=self.websocket_entry,
             template=self.chat_template,
+            on_delta=on_delta,
         )
-        return result.text, result.conversation_id
+        self.note_conversation_usage(resolved_conversation_id, result)
+        return result
+
+    def note_conversation_usage(self, conversation_id: str, result: ChatResult) -> None:
+        metrics = result.metrics or {}
+        throttling = metrics.get("throttling")
+        if not isinstance(throttling, dict):
+            return
+        current = throttling.get("numUserMessagesInConversation")
+        maximum = throttling.get("maxNumUserMessagesInConversation")
+        if conversation_id == self.default_conversation_id and isinstance(current, int) and isinstance(maximum, int) and current >= maximum:
+            self.default_conversation_id = str(uuid.uuid4())
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -242,10 +267,12 @@ class Handler(BaseHTTPRequestHandler):
         if not prompt:
             raise ValueError("No text prompt found in messages")
 
-        text, conversation_id = self.gateway.complete(prompt, self.conversation_id_from(payload))
+        conversation_id = self.gateway.resolve_conversation_id(self.conversation_id_from(payload))
         if payload.get("stream"):
-            self.write_openai_chat_stream(text, conversation_id)
+            self.write_openai_chat_stream(prompt, conversation_id)
             return
+        result = self.gateway.complete(prompt, conversation_id)
+        text = result.text
 
         created = int(time.time())
         self.write_json(
@@ -263,6 +290,7 @@ class Handler(BaseHTTPRequestHandler):
                 ],
                 "usage": estimated_usage(prompt, text),
                 "m365_conversation_id": conversation_id,
+                "m365_metrics": result.metrics or {},
             },
             headers={"X-M365-Conversation-Id": conversation_id},
         )
@@ -272,10 +300,12 @@ class Handler(BaseHTTPRequestHandler):
         if not prompt:
             raise ValueError("No text prompt found in input")
 
-        text, conversation_id = self.gateway.complete(prompt, self.conversation_id_from(payload))
+        conversation_id = self.gateway.resolve_conversation_id(self.conversation_id_from(payload))
         if payload.get("stream"):
-            self.write_responses_stream(text, conversation_id)
+            self.write_responses_stream(prompt, conversation_id)
             return
+        result = self.gateway.complete(prompt, conversation_id)
+        text = result.text
 
         response_id = f"resp_{uuid.uuid4().hex}"
         self.write_json(
@@ -296,7 +326,7 @@ class Handler(BaseHTTPRequestHandler):
                 ],
                 "output_text": text,
                 "usage": estimated_usage(prompt, text),
-                "metadata": {"m365_conversation_id": conversation_id},
+                "metadata": {"m365_conversation_id": conversation_id, "m365_metrics": result.metrics or {}},
             },
             headers={"X-M365-Conversation-Id": conversation_id},
         )
@@ -312,10 +342,12 @@ class Handler(BaseHTTPRequestHandler):
         if not prompt:
             raise ValueError("No text prompt found in messages")
 
-        text, conversation_id = self.gateway.complete(prompt, self.conversation_id_from(payload))
+        conversation_id = self.gateway.resolve_conversation_id(self.conversation_id_from(payload))
         if payload.get("stream"):
-            self.write_anthropic_stream(text, conversation_id)
+            self.write_anthropic_stream(prompt, conversation_id)
             return
+        result = self.gateway.complete(prompt, conversation_id)
+        text = result.text
 
         self.write_json(
             {
@@ -327,6 +359,8 @@ class Handler(BaseHTTPRequestHandler):
                 "stop_reason": "end_turn",
                 "stop_sequence": None,
                 "usage": estimated_anthropic_usage(prompt, text),
+                "m365_conversation_id": conversation_id,
+                "m365_metrics": result.metrics or {},
             },
             headers={"X-M365-Conversation-Id": conversation_id},
         )
@@ -336,7 +370,7 @@ class Handler(BaseHTTPRequestHandler):
         prompt = prompt_from_anthropic_messages(messages) if isinstance(messages, list) else json.dumps(payload)
         self.write_json({"input_tokens": estimate_tokens(prompt)})
 
-    def write_openai_chat_stream(self, text: str, conversation_id: str) -> None:
+    def write_openai_chat_stream(self, prompt: str, conversation_id: str) -> None:
         created = int(time.time())
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
         self.start_sse(headers={"X-M365-Conversation-Id": conversation_id})
@@ -349,15 +383,19 @@ class Handler(BaseHTTPRequestHandler):
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
             }
         )
-        self.write_sse(
-            {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": MODEL_ID,
-                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
-            }
-        )
+
+        def on_delta(delta: str) -> None:
+            self.write_sse(
+                {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": MODEL_ID,
+                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                }
+            )
+
+        self.gateway.complete(prompt, conversation_id, on_delta=on_delta)
         self.write_sse(
             {
                 "id": chunk_id,
@@ -368,36 +406,48 @@ class Handler(BaseHTTPRequestHandler):
             }
         )
         self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
-    def write_responses_stream(self, text: str, conversation_id: str) -> None:
+    def write_responses_stream(self, prompt: str, conversation_id: str) -> None:
         response_id = f"resp_{uuid.uuid4().hex}"
         self.start_sse(headers={"X-M365-Conversation-Id": conversation_id})
         self.write_sse({"type": "response.created", "response": {"id": response_id, "status": "in_progress", "model": MODEL_ID}})
-        self.write_sse({"type": "response.output_text.delta", "item_id": "output_0", "output_index": 0, "content_index": 0, "delta": text})
-        self.write_sse({"type": "response.completed", "response": {"id": response_id, "status": "completed", "output_text": text}})
+        result = self.gateway.complete(
+            prompt,
+            conversation_id,
+            on_delta=lambda delta: self.write_sse({"type": "response.output_text.delta", "item_id": "output_0", "output_index": 0, "content_index": 0, "delta": delta}),
+        )
+        self.write_sse({"type": "response.completed", "response": {"id": response_id, "status": "completed", "output_text": result.text, "metadata": {"m365_metrics": result.metrics or {}}}})
         self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
-    def write_anthropic_stream(self, text: str, conversation_id: str) -> None:
+    def write_anthropic_stream(self, prompt: str, conversation_id: str) -> None:
         message_id = f"msg_{uuid.uuid4().hex}"
         self.start_sse(headers={"X-M365-Conversation-Id": conversation_id})
         self.write_sse_event("message_start", {"type": "message_start", "message": {"id": message_id, "type": "message", "role": "assistant", "model": MODEL_ID, "content": [], "usage": {"input_tokens": 0, "output_tokens": 0}}})
         self.write_sse_event("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
-        self.write_sse_event("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})
+        result = self.gateway.complete(
+            prompt,
+            conversation_id,
+            on_delta=lambda delta: self.write_sse_event("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta}}),
+        )
         self.write_sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
-        self.write_sse_event("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": estimate_tokens(text)}})
+        self.write_sse_event("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": estimate_tokens(result.text)}, "m365_metrics": result.metrics or {}})
         self.write_sse_event("message_stop", {"type": "message_stop"})
 
     def start_sse(self, headers: dict[str, str] | None = None) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
+        self.close_connection = True
 
     def write_sse(self, data: dict[str, Any]) -> None:
         self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8"))
+        self.wfile.flush()
 
     def write_sse_event(self, event: str, data: dict[str, Any]) -> None:
         self.wfile.write(f"event: {event}\n".encode("utf-8"))
@@ -459,6 +509,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--token-refresh-skew", type=int, default=DEFAULT_TOKEN_REFRESH_SKEW_SECONDS)
     parser.add_argument("--no-auto-refresh-token", action="store_true")
+    parser.add_argument("--new-conversation-per-request", action="store_true")
     parser.add_argument("--max-body-bytes", type=int, default=2_000_000)
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args(argv)

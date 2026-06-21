@@ -37,6 +37,15 @@ python m365_auth.py --interactive
 python m365_gateway.py --host 127.0.0.1 --port 8787
 ```
 
+By default the gateway keeps one shared conversation and streams upstream
+deltas to clients.
+
+Useful compatibility switches:
+
+```powershell
+python m365_gateway.py --new-conversation-per-request
+```
+
 Endpoints:
 
 ```text
