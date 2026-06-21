@@ -1,3 +1,12 @@
+Visit https://m365.cloud.microsoft/chat  
+
+<img width="769" height="185" alt="image" src="https://github.com/user-attachments/assets/fe387176-0c0d-4fc9-a3d4-63dc9f20164e" />  
+  
+Export Har  
+Enjoy m365 Gpt5.5 Think outside of the traditional chat window  
+
+
+
 # m365-auth
 
 Local Python gateway for calling your authenticated M365 Copilot ChatHub session
