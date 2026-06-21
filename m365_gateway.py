@@ -29,6 +29,8 @@ from m365_auth import (
     DEFAULT_TOKEN_REFRESH_SKEW_SECONDS,
     OAUTH_REFRESH_ENTRY,
     ensure_chat_token,
+    extract_chat_template,
+    get_raw_entry,
     load_env,
     read_har,
     send_chat_prompt,
@@ -102,6 +104,8 @@ class Gateway:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.entries = read_har(args.har)
+        self.websocket_entry = self.entries[args.websocket_entry]
+        self.chat_template = extract_chat_template(get_raw_entry(args.har, args.websocket_entry))
         self.proxy_api_key = load_env(args.env).get("M365_PROXY_API_KEY", "")
 
     def env(self) -> dict[str, str]:
@@ -134,6 +138,8 @@ class Gateway:
             conversation_id=resolved_conversation_id,
             stream=False,
             raw_websocket=False,
+            entry=self.websocket_entry,
+            template=self.chat_template,
         )
         return result.text, result.conversation_id
 

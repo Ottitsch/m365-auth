@@ -702,11 +702,13 @@ def send_chat_prompt(
     conversation_id: str,
     stream: bool = False,
     raw_websocket: bool = False,
+    entry: HarEntry | None = None,
+    template: dict[str, Any] | None = None,
 ) -> ChatResult:
-    entries = read_har(har_path)
-    entry = entries[websocket_entry]
-    raw_entry = get_raw_entry(har_path, websocket_entry)
-    template = extract_chat_template(raw_entry)
+    if entry is None:
+        entry = read_har(har_path)[websocket_entry]
+    if template is None:
+        template = extract_chat_template(get_raw_entry(har_path, websocket_entry))
 
     trace_id = uuid.uuid4().hex
     session_id = str(uuid.uuid4())
@@ -782,6 +784,7 @@ def run_chat_prompt(
     env: dict[str, str],
     prompt: str,
     conversation_id: str,
+    template: dict[str, Any] | None = None,
 ) -> int:
     try:
         result = send_chat_prompt(
@@ -793,6 +796,8 @@ def run_chat_prompt(
             conversation_id=conversation_id,
             stream=args.stream,
             raw_websocket=args.raw_websocket,
+            entry=entries[args.websocket_entry],
+            template=template,
         )
         if not args.raw_websocket:
             if args.stream:
@@ -807,6 +812,7 @@ def run_chat_prompt(
 
 def run_chat(args: argparse.Namespace, entries: list[HarEntry], env: dict[str, str]) -> int:
     entry = entries[args.websocket_entry]
+    template = extract_chat_template(get_raw_entry(args.har, args.websocket_entry))
     conversation_id = resolve_conversation_id(args, entry, env)
     print(f"ConversationId={conversation_id}")
 
@@ -820,7 +826,7 @@ def run_chat(args: argparse.Namespace, entries: list[HarEntry], env: dict[str, s
                 return 0
             if not prompt or prompt.lower() in {"/exit", "/quit"}:
                 return 0
-            status = run_chat_prompt(args, entries, env, prompt, conversation_id)
+            status = run_chat_prompt(args, entries, env, prompt, conversation_id, template)
             if status:
                 return status
 
@@ -828,7 +834,7 @@ def run_chat(args: argparse.Namespace, entries: list[HarEntry], env: dict[str, s
         print("--chat is required unless --interactive is used.", file=sys.stderr)
         return 1
 
-    return run_chat_prompt(args, entries, env, args.chat, conversation_id)
+    return run_chat_prompt(args, entries, env, args.chat, conversation_id, template)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
