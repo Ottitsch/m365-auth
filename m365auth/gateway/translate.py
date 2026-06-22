@@ -13,6 +13,8 @@ def extract_text_content(content: Any) -> str:
         parts: list[str] = []
         for item in content:
             if isinstance(item, dict):
+                if item.get("type") in {"tool_use", "tool_result"}:
+                    continue  # handled separately by _render_message
                 if isinstance(item.get("text"), str):
                     parts.append(item["text"])
                 elif isinstance(item.get("content"), str):
@@ -23,19 +25,94 @@ def extract_text_content(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def prompt_from_messages(messages: list[dict[str, Any]]) -> str:
-    """Render a list of {role, content} messages into a single prompt string.
+def _render_message(message: dict[str, Any]) -> str | None:
+    """Render one message, including tool calls/results, into prompt text."""
+    role = message.get("role", "user")
+    content = message.get("content")
 
-    Used for both OpenAI-style and Anthropic-style message arrays; they share
-    this shape.
+    # OpenAI tool-result message.
+    if role == "tool":
+        text = extract_text_content(content)
+        name = message.get("name") or message.get("tool_call_id") or "tool"
+        return f"tool result ({name}): {text}" if text else None
+
+    parts: list[str] = []
+    text = extract_text_content(content)
+    if text:
+        parts.append(text)
+
+    # Anthropic tool_use / tool_result content blocks.
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_use":
+                args = json.dumps(item.get("input") or {}, ensure_ascii=False)
+                parts.append(f"[called tool {item.get('name')} with arguments {args}]")
+            elif item.get("type") == "tool_result":
+                result = extract_text_content(item.get("content"))
+                parts.append(f"[tool result: {result}]")
+
+    # OpenAI assistant tool_calls.
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        parts.append(f"[called tool {fn.get('name')} with arguments {fn.get('arguments')}]")
+
+    if not parts:
+        return None
+    return f"{role}: " + " ".join(parts)
+
+
+def prompt_from_messages(messages: list[dict[str, Any]]) -> str:
+    """Render a list of messages into a single prompt string.
+
+    Used for both OpenAI-style and Anthropic-style message arrays, including
+    tool calls and tool results.
     """
-    rendered: list[str] = []
-    for message in messages:
-        role = message.get("role", "user")
-        content = extract_text_content(message.get("content"))
-        if content:
-            rendered.append(f"{role}: {content}")
+    rendered = [line for message in messages if (line := _render_message(message))]
     return "\n\n".join(rendered).strip()
+
+
+def tools_from_request(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize OpenAI/Anthropic tool definitions into {name, description, parameters}."""
+    tools: list[dict[str, Any]] = []
+
+    raw = payload.get("tools")
+    if isinstance(raw, list):
+        for tool in raw:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+                fn = tool["function"]  # OpenAI
+                tools.append(
+                    {
+                        "name": fn.get("name"),
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters") or {},
+                    }
+                )
+            elif tool.get("name"):
+                tools.append(  # Anthropic
+                    {
+                        "name": tool.get("name"),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("input_schema") or tool.get("parameters") or {},
+                    }
+                )
+
+    legacy = payload.get("functions")  # deprecated OpenAI functions
+    if isinstance(legacy, list):
+        for fn in legacy:
+            if isinstance(fn, dict) and fn.get("name"):
+                tools.append(
+                    {
+                        "name": fn["name"],
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters") or {},
+                    }
+                )
+
+    return [tool for tool in tools if tool.get("name")]
 
 
 def prompt_from_responses_input(value: Any) -> str:

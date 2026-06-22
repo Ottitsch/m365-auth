@@ -15,10 +15,12 @@ from ..chat import ChatResult, extract_chat_template, send_chat_prompt
 from ..env import load_env
 from ..har import get_raw_entry, read_har
 from ..tokens import ensure_chat_token
+from .tools import ToolCall, parse_tool_calls, render_tool_preamble
 from .translate import (
     extract_text_content,
     prompt_from_messages,
     prompt_from_responses_input,
+    tools_from_request,
 )
 from .usage import estimate_tokens, estimated_anthropic_usage, estimated_usage
 
@@ -192,12 +194,34 @@ class Handler(BaseHTTPRequestHandler):
         if not prompt:
             raise ValueError("No text prompt found in messages")
 
+        tools = tools_from_request(payload)
+        # Directive goes AFTER the conversation: Copilot weights recent instructions
+        # more heavily and otherwise just answers the question directly.
+        full_prompt = f"{prompt}\n\n{render_tool_preamble(tools)}" if tools else prompt
+
         conversation_id = self.gateway.resolve_conversation_id(self.conversation_id_from(payload))
         if payload.get("stream"):
-            self.write_openai_chat_stream(prompt, conversation_id)
+            if tools:
+                # Tool calls must be parsed from the full reply, so buffer then
+                # emit as a single SSE sequence to honor the client's stream flag.
+                self.write_openai_tool_stream(full_prompt, conversation_id, tools)
+            else:
+                self.write_openai_chat_stream(prompt, conversation_id)
             return
-        result = self.gateway.complete(prompt, conversation_id)
+        result = self.gateway.complete(full_prompt, conversation_id)
         text = result.text
+
+        tool_calls = parse_tool_calls(text, {t["name"] for t in tools}) if tools else None
+        if tool_calls:
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [call.to_openai() for call in tool_calls],
+            }
+            finish_reason = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": text}
+            finish_reason = "stop"
 
         created = int(time.time())
         self.write_json(
@@ -209,11 +233,11 @@ class Handler(BaseHTTPRequestHandler):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
+                        "message": message,
+                        "finish_reason": finish_reason,
                     }
                 ],
-                "usage": estimated_usage(prompt, text),
+                "usage": estimated_usage(full_prompt, text),
                 "m365_conversation_id": conversation_id,
                 "m365_metrics": result.metrics or {},
             },
@@ -267,12 +291,26 @@ class Handler(BaseHTTPRequestHandler):
         if not prompt:
             raise ValueError("No text prompt found in messages")
 
+        tools = tools_from_request(payload)
+        full_prompt = f"{prompt}\n\n{render_tool_preamble(tools)}" if tools else prompt
+
         conversation_id = self.gateway.resolve_conversation_id(self.conversation_id_from(payload))
         if payload.get("stream"):
-            self.write_anthropic_stream(prompt, conversation_id)
+            if tools:
+                self.write_anthropic_tool_stream(full_prompt, conversation_id, tools)
+            else:
+                self.write_anthropic_stream(prompt, conversation_id)
             return
-        result = self.gateway.complete(prompt, conversation_id)
+        result = self.gateway.complete(full_prompt, conversation_id)
         text = result.text
+
+        tool_calls = parse_tool_calls(text, {t["name"] for t in tools}) if tools else None
+        if tool_calls:
+            content: list[dict[str, Any]] = [call.to_anthropic() for call in tool_calls]
+            stop_reason = "tool_use"
+        else:
+            content = [{"type": "text", "text": text}]
+            stop_reason = "end_turn"
 
         self.write_json(
             {
@@ -280,10 +318,10 @@ class Handler(BaseHTTPRequestHandler):
                 "type": "message",
                 "role": "assistant",
                 "model": payload.get("model") or MODEL_ID,
-                "content": [{"type": "text", "text": text}],
-                "stop_reason": "end_turn",
+                "content": content,
+                "stop_reason": stop_reason,
                 "stop_sequence": None,
-                "usage": estimated_anthropic_usage(prompt, text),
+                "usage": estimated_anthropic_usage(full_prompt, text),
                 "m365_conversation_id": conversation_id,
                 "m365_metrics": result.metrics or {},
             },
@@ -333,6 +371,54 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
+    def _complete_with_tools(
+        self,
+        prompt: str,
+        conversation_id: str,
+        valid_names: set[str],
+    ) -> tuple[str, list[ToolCall] | None]:
+        """Run a tool-enabled completion and parse the final reply.
+
+        Deliberately NOT streamed token-by-token: M365 Copilot emits intermediate
+        "thinking" text before its final answer, and that final answer may be a
+        tool call. Only the fully reconciled reply can be classified reliably, so
+        tool-enabled requests are buffered and replayed as one SSE sequence.
+        """
+        result = self.gateway.complete(prompt, conversation_id)
+        return result.text, parse_tool_calls(result.text, valid_names)
+
+    def write_openai_tool_stream(self, prompt: str, conversation_id: str, tools: list[dict[str, Any]]) -> None:
+        """Buffer a tool-enabled OpenAI completion, then replay it as one SSE sequence."""
+        created = int(time.time())
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+        # Complete BEFORE opening the SSE stream: if the upstream call fails, the
+        # exception can become a clean HTTP error instead of a truncated stream
+        # (which clients report as "Stream ended without finish_reason").
+        text, tool_calls = self._complete_with_tools(prompt, conversation_id, {t["name"] for t in tools})
+        self.start_sse(headers={"X-M365-Conversation-Id": conversation_id})
+
+        def chunk(delta: dict[str, Any], finish_reason: str | None) -> None:
+            self.write_sse(
+                {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": MODEL_ID,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                }
+            )
+
+        chunk({"role": "assistant"}, None)
+        if tool_calls:
+            for index, call in enumerate(tool_calls):
+                chunk({"tool_calls": [{"index": index, **call.to_openai()}]}, None)
+            chunk({}, "tool_calls")
+        else:
+            chunk({"content": text}, None)
+            chunk({}, "stop")
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
     def write_responses_stream(self, prompt: str, conversation_id: str) -> None:
         response_id = f"resp_{uuid.uuid4().hex}"
         self.start_sse(headers={"X-M365-Conversation-Id": conversation_id})
@@ -358,6 +444,27 @@ class Handler(BaseHTTPRequestHandler):
         )
         self.write_sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
         self.write_sse_event("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": estimate_tokens(result.text)}, "m365_metrics": result.metrics or {}})
+        self.write_sse_event("message_stop", {"type": "message_stop"})
+
+    def write_anthropic_tool_stream(self, prompt: str, conversation_id: str, tools: list[dict[str, Any]]) -> None:
+        """Buffer a tool-enabled Anthropic message, then replay it as one SSE sequence."""
+        message_id = f"msg_{uuid.uuid4().hex}"
+        text, tool_calls = self._complete_with_tools(prompt, conversation_id, {t["name"] for t in tools})
+
+        self.start_sse(headers={"X-M365-Conversation-Id": conversation_id})
+        self.write_sse_event("message_start", {"type": "message_start", "message": {"id": message_id, "type": "message", "role": "assistant", "model": MODEL_ID, "content": [], "usage": {"input_tokens": 0, "output_tokens": 0}}})
+
+        if tool_calls:
+            for index, call in enumerate(tool_calls):
+                self.write_sse_event("content_block_start", {"type": "content_block_start", "index": index, "content_block": {"type": "tool_use", "id": call.id, "name": call.name, "input": {}}})
+                self.write_sse_event("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": json.dumps(call.arguments, ensure_ascii=False)}})
+                self.write_sse_event("content_block_stop", {"type": "content_block_stop", "index": index})
+            self.write_sse_event("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": estimate_tokens(text)}})
+        else:
+            self.write_sse_event("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+            self.write_sse_event("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})
+            self.write_sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+            self.write_sse_event("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": estimate_tokens(text)}})
         self.write_sse_event("message_stop", {"type": "message_stop"})
 
     def start_sse(self, headers: dict[str, str] | None = None) -> None:

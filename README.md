@@ -32,6 +32,34 @@ Optional local gateway auth:
 M365_PROXY_API_KEY=change-this
 ```
 
+## Refreshing credentials (optional, Playwright)
+
+The captured HAR's SPA refresh token has a hard ~24h lifetime, so credentials go
+stale daily. Instead of re-exporting a HAR each time, an optional helper logs in
+with a real browser and harvests fresh tokens/cookies into `.env`, reusing your
+existing HAR as the stable request template.
+
+This is the only part of the project that is not pure stdlib, so keep it in a
+venv:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install playwright
+.\.venv\Scripts\python -m playwright install chromium
+```
+
+Then refresh credentials (log in / do MFA on the first headed run; the browser
+profile persists under `~/.m365auth/pw-profile`):
+
+```powershell
+.\.venv\Scripts\python -m m365auth.login            # headed; log in on first run
+.\.venv\Scripts\python -m m365auth.login --headless # once the profile is logged in
+```
+
+If no access token is captured, send one chat message in the opened browser to
+open the ChatHub socket. The gateway itself still runs on plain `python`
+(stdlib only).
+
 ## Direct Chat
 
 ```powershell
@@ -111,11 +139,48 @@ $env:ANTHROPIC_AUTH_TOKEN = $env:M365_PROXY_API_KEY
 $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1"
 ```
 
+pi (Pi Coding Agent):
+
+Create `~/.pi/agent/extensions/m365.ts`:
+
+```typescript
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+export default function (pi: ExtensionAPI) {
+  pi.registerProvider("m365", {
+    name: "M365 Copilot Gateway",
+    baseUrl: "http://127.0.0.1:8787/v1",
+    apiKey: "local", // any non-empty value when gateway auth is disabled
+    api: "openai-completions",
+    authHeader: true,
+    models: [
+      {
+        id: "m365-copilot",
+        name: "M365 Copilot",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128000,
+        maxTokens: 8192,
+        compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+      },
+    ],
+  });
+}
+```
+
+Then launch with `pi --model m365-copilot` (verify with `pi --list-models`).
+
 ## Notes
 
 - Uses only Python stdlib.
 - The ChatHub WebSocket and OAuth refresh entries are auto-detected from the HAR
   by content. Override with `--websocket-entry` / `--oauth-refresh-entry` if needed.
 - Auto-refreshes the ChatHub access token when the captured refresh token works.
-- Tool calling is not implemented yet.
+- Tool calling is emulated for both OpenAI (`/v1/chat/completions`) and
+  Anthropic (`/v1/messages`): tool definitions are injected into the prompt and
+  tool calls are parsed back out of the text reply. Reliability depends on the
+  model following the protocol. Tool-enabled streaming requests are buffered,
+  not streamed token-by-token: Copilot emits intermediate "thinking" text before
+  its final answer, so only the fully reconciled reply can be classified.
 - Microsoft can change private endpoints at any time.
