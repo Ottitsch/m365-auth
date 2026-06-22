@@ -23,7 +23,7 @@ Export an authenticated HAR from `https://m365.cloud.microsoft/chat`, place it
 in this folder, then run:
 
 ```powershell
-python m365_auth.py --init-env
+python -m m365auth --init-env
 ```
 
 Optional local gateway auth:
@@ -35,15 +35,15 @@ M365_PROXY_API_KEY=change-this
 ## Direct Chat
 
 ```powershell
-python m365_auth.py --chat "Reply with only OK." --new-conversation
-python m365_auth.py --chat "continue this chat" --continue-chat
-python m365_auth.py --interactive
+python -m m365auth --chat "Reply with only OK." --new-conversation
+python -m m365auth --chat "continue this chat" --continue-chat
+python -m m365auth --interactive
 ```
 
 ## HTTP Gateway
 
 ```powershell
-python m365_gateway.py --host 127.0.0.1 --port 8787
+python -m m365auth.gateway --host 127.0.0.1 --port 8787
 ```
 
 By default the gateway keeps one shared conversation and streams upstream
@@ -52,7 +52,7 @@ deltas to clients.
 Useful compatibility switches:
 
 ```powershell
-python m365_gateway.py --new-conversation-per-request
+python -m m365auth.gateway --new-conversation-per-request
 ```
 
 Endpoints:
@@ -114,6 +114,8 @@ $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1"
 ## Notes
 
 - Uses only Python stdlib.
+- The ChatHub WebSocket and OAuth refresh entries are auto-detected from the HAR
+  by content. Override with `--websocket-entry` / `--oauth-refresh-entry` if needed.
 - Auto-refreshes the ChatHub access token when the captured refresh token works.
 - Tool calling is not implemented yet.
 - Microsoft can change private endpoints at any time.

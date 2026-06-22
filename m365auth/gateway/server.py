@@ -1,103 +1,28 @@
-#!/usr/bin/env python3
-"""
-Local stdlib HTTP gateway for the captured M365 Copilot ChatHub flow.
-
-This intentionally binds to 127.0.0.1 by default. It exposes small
-OpenAI-compatible and Anthropic-compatible surfaces that translate requests into
-the ChatHub WebSocket call implemented in m365_auth.py.
-"""
+"""The local HTTP gateway: request routing, streaming, and ChatHub bridging."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 import uuid
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from http.server import BaseHTTPRequestHandler
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from m365_auth import (
-    CHAT_SCOPE,
-    CHAT_TOKEN_ENTRY,
-    DEFAULT_ENV,
-    DEFAULT_HAR,
-    DEFAULT_TOKEN_REFRESH_SKEW_SECONDS,
-    ChatResult,
-    OAUTH_REFRESH_ENTRY,
-    ensure_chat_token,
-    extract_chat_template,
-    get_raw_entry,
-    load_env,
-    read_har,
-    send_chat_prompt,
+from ..chat import ChatResult, extract_chat_template, send_chat_prompt
+from ..env import load_env
+from ..har import get_raw_entry, read_har
+from ..tokens import ensure_chat_token
+from .translate import (
+    extract_text_content,
+    prompt_from_messages,
+    prompt_from_responses_input,
 )
-
+from .usage import estimate_tokens, estimated_anthropic_usage, estimated_usage
 
 MODEL_ID = "m365-copilot"
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure:
-            reconfigure(encoding="utf-8", errors="replace")
-
-
-def extract_text_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                if isinstance(item.get("text"), str):
-                    parts.append(item["text"])
-                elif isinstance(item.get("content"), str):
-                    parts.append(item["content"])
-            elif isinstance(item, str):
-                parts.append(item)
-        return "\n".join(parts)
-    return "" if content is None else str(content)
-
-
-def prompt_from_openai_messages(messages: list[dict[str, Any]]) -> str:
-    rendered: list[str] = []
-    for message in messages:
-        role = message.get("role", "user")
-        content = extract_text_content(message.get("content"))
-        if content:
-            rendered.append(f"{role}: {content}")
-    return "\n\n".join(rendered).strip()
-
-
-def prompt_from_responses_input(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        messages: list[dict[str, Any]] = []
-        for item in value:
-            if isinstance(item, dict):
-                if "role" in item:
-                    messages.append(item)
-                elif item.get("type") in {"message", "input_text"}:
-                    messages.append({"role": item.get("role", "user"), "content": item.get("content") or item.get("text")})
-        if messages:
-            return prompt_from_openai_messages(messages)
-    return json.dumps(value, ensure_ascii=False)
-
-
-def prompt_from_anthropic_messages(messages: list[dict[str, Any]]) -> str:
-    rendered: list[str] = []
-    for message in messages:
-        role = message.get("role", "user")
-        content = extract_text_content(message.get("content"))
-        if content:
-            rendered.append(f"{role}: {content}")
-    return "\n\n".join(rendered).strip()
 
 
 class Gateway:
@@ -263,7 +188,7 @@ class Handler(BaseHTTPRequestHandler):
         messages = payload.get("messages") or []
         if not isinstance(messages, list):
             raise ValueError("messages must be a list")
-        prompt = prompt_from_openai_messages(messages)
+        prompt = prompt_from_messages(messages)
         if not prompt:
             raise ValueError("No text prompt found in messages")
 
@@ -336,7 +261,7 @@ class Handler(BaseHTTPRequestHandler):
         messages = payload.get("messages") or []
         if not isinstance(messages, list):
             raise ValueError("messages must be a list")
-        prompt = prompt_from_anthropic_messages(messages)
+        prompt = prompt_from_messages(messages)
         if system:
             prompt = f"system: {extract_text_content(system)}\n\n{prompt}".strip()
         if not prompt:
@@ -367,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_anthropic_count_tokens(self, payload: dict[str, Any]) -> None:
         messages = payload.get("messages") or []
-        prompt = prompt_from_anthropic_messages(messages) if isinstance(messages, list) else json.dumps(payload)
+        prompt = prompt_from_messages(messages) if isinstance(messages, list) else json.dumps(payload)
         self.write_json({"input_tokens": estimate_tokens(prompt)})
 
     def write_openai_chat_stream(self, prompt: str, conversation_id: str) -> None:
@@ -473,66 +398,3 @@ class Handler(BaseHTTPRequestHandler):
             {"error": {"type": code, "message": message}},
             status=status,
         )
-
-
-def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
-
-
-def estimated_usage(prompt: str, output: str) -> dict[str, int]:
-    prompt_tokens = estimate_tokens(prompt)
-    completion_tokens = estimate_tokens(output)
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    }
-
-
-def estimated_anthropic_usage(prompt: str, output: str) -> dict[str, int]:
-    return {
-        "input_tokens": estimate_tokens(prompt),
-        "output_tokens": estimate_tokens(output),
-    }
-
-
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8787)
-    parser.add_argument("--har", type=Path, default=DEFAULT_HAR)
-    parser.add_argument("--env", type=Path, default=DEFAULT_ENV)
-    parser.add_argument("--websocket-entry", type=int, default=CHAT_TOKEN_ENTRY)
-    parser.add_argument("--oauth-refresh-entry", type=int, default=OAUTH_REFRESH_ENTRY)
-    parser.add_argument("--chat-scope", default=CHAT_SCOPE)
-    parser.add_argument("--websocket-timeout", type=float, default=90.0)
-    parser.add_argument("--timeout", type=float, default=30.0)
-    parser.add_argument("--token-refresh-skew", type=int, default=DEFAULT_TOKEN_REFRESH_SKEW_SECONDS)
-    parser.add_argument("--no-auto-refresh-token", action="store_true")
-    parser.add_argument("--new-conversation-per-request", action="store_true")
-    parser.add_argument("--max-body-bytes", type=int, default=2_000_000)
-    parser.add_argument("--quiet", action="store_true")
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str]) -> int:
-    configure_stdio()
-    args = parse_args(argv)
-    gateway = Gateway(args)
-
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.gateway = gateway  # type: ignore[attr-defined]
-
-    auth_state = "enabled" if gateway.proxy_api_key else "disabled"
-    print(f"Serving M365 gateway on http://{args.host}:{args.port} auth={auth_state}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print()
-    finally:
-        server.server_close()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
